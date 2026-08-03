@@ -12,16 +12,16 @@ search-only backend is a first-class case.
 
 ## What it registers
 
-|                                              |                         |
-| -------------------------------------------- | ----------------------- |
-| Package specifier (for `PLATYPUS_PLUGINS`)   | `@platypus-local/searx` |
-| Manifest name (for `PLATYPUS_PLUGIN_CONFIG`) | `searx`                 |
-| Backend id (stored in `provider.webBackend`) | `searx.web`             |
-| Display name                                 | SearXNG                 |
+|                                              |                               |
+| -------------------------------------------- | ----------------------------- |
+| Entry for `PLATYPUS_PLUGINS`                 | `/app/plugins/searx/index.ts` |
+| Manifest name (for `PLATYPUS_PLUGIN_CONFIG`) | `searx`                       |
+| Backend id (stored in `provider.webBackend`) | `searx.web`                   |
+| Display name                                 | SearXNG                       |
 
-The two names are different on purpose, and mixing them up is the usual failure:
-the plugin **list** takes the package specifier, the **config object** is keyed by
-the manifest name.
+The backend id is what gets persisted on the Provider row, so the manifest `name`
+and the contribution's bare `backend` are both fixed for good — renaming either
+orphans every Provider pointing at it as `(not installed)`.
 
 ## Requirements
 
@@ -43,29 +43,48 @@ search:
 
 ## Install
 
-The plugin has to resolve from the backend's `node_modules`, so with the Docker
-image it must be part of the pnpm workspace at build time. Copy this directory to
-`packages/searx-backend/` in the Platypus tree, add it to the backend's
-dependencies (**`dependencies`**, not `devDependencies` — the image's `prod-deps`
-stage runs `pnpm install --prod`), and refresh the lockfile:
-
-```jsonc
-// apps/backend/package.json
-"dependencies": {
-  "@platypus-local/searx": "workspace:*"
-}
-```
+**Nothing in the Platypus repo changes.** The plugin is a directory beside the
+deployment, bind-mounted into the backend container and named in
+`PLATYPUS_PLUGINS` by path.
 
 ```bash
-pnpm install   # commit the updated pnpm-lock.yaml; the image build uses --frozen-lockfile
+# on the host running Platypus
+git clone <this repo> /srv/platypus-plugins/searx
+cd /srv/platypus-plugins/searx && npm install --omit=dev   # zod, nothing else
 ```
+
+Then add a compose overlay next to the deployment's `compose.yaml`:
+
+```yaml
+services:
+  backend:
+    volumes:
+      - /srv/platypus-plugins/searx:/app/plugins/searx:ro
+    environment:
+      # Compose `environment:` REPLACES the .env value rather than appending, so
+      # this must be the deployment's complete gate-able plugin set.
+      PLATYPUS_PLUGINS: "@platypus/web-fetch,/app/plugins/searx/index.ts"
+```
+
+Two details that decide whether this resolves:
+
+- **Mount outside `node_modules`.** Node refuses to strip types from any file
+  under a `node_modules` directory, and this plugin ships TypeScript. `/app/plugins`
+  keeps it clear of that rule. (A plugin published to a registry as compiled JS is
+  installed the ordinary way and named by package specifier instead.)
+- **Ship your own `node_modules`.** Module resolution walks up from the plugin's
+  own directory, not the backend's, so `zod` must sit in
+  `/srv/platypus-plugins/searx/node_modules`.
 
 ## Configure
 
 ```
-PLATYPUS_PLUGINS=@platypus/web-fetch,@platypus-local/searx
+PLATYPUS_PLUGINS=@platypus/web-fetch,/app/plugins/searx/index.ts
 PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{"baseUrl":"http://searxng:8080"}}}
 ```
+
+The plugin **list** takes whatever `import()` can resolve — a package specifier
+or a path. The **config object** is always keyed by the manifest name (`searx`).
 
 | Key          | Required | Default   | Meaning                                                                                                                                  |
 | ------------ | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------- |

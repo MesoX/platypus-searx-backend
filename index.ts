@@ -1,10 +1,15 @@
+import { z } from "zod";
 import type {
   PlatypusPlugin,
   PluginConfigContext,
   WebSearchResult,
-} from "@platypuschat/plugin-sdk";
-import { PLUGIN_API_VERSION } from "@platypuschat/plugin-sdk";
-import { z } from "zod";
+} from "./types.ts";
+
+// The API major this manifest targets (ADR-0013: apiVersion is majors-only, and
+// core accepts N and N-1). Inlined rather than imported from
+// @platypuschat/plugin-sdk so the plugin's only runtime dependency is zod — see
+// types.ts for why the SDK is a type-only dependency here.
+const PLUGIN_API_VERSION = 1;
 
 // A third-party Platypus Web-search backend (ADR-0014) backed by a self-hosted
 // SearXNG instance. Out of tree by design: core deliberately ships no backend,

@@ -7,15 +7,8 @@
   "type": "module",
   "main": "index.ts",
   "types": "index.ts",
-  "files": ["index.ts"],
-  "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit"
-  },
+  "files": ["index.ts", "types.ts"],
   "dependencies": {
-    "@platypuschat/plugin-sdk": "workspace:*",
     "zod": "^4.4.3"
-  },
-  "devDependencies": {
-    "typescript": "^6.0.3"
   }
 }
