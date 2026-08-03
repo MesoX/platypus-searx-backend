@@ -1,14 +1,16 @@
 # @platypus-local/searx
 
-A Platypus **Web-search backend** (ADR-0014 Extension point) backed by a
-self-hosted [SearXNG](https://docs.searxng.org/) instance.
+A Platypus **Web-search backend** (ADR-0014 Extension point): search through a
+self-hosted [SearXNG](https://docs.searxng.org/) instance, page reading through a
+headless browser over CDP.
 
 Platypus core deliberately ships no web-search backend, so a Provider pointed at
 a self-hosted OpenAI-compatible endpoint (vLLM, LiteLLM, SGLang) has a chat
 search toggle with nothing behind it. This plugin fills that slot.
 
-It contributes `web_search` only. `read_url` is optional in the contract, and a
-search-only backend is a first-class case.
+`web_search` is always contributed. `read_url` appears only when `browserUrl` is
+configured — it is optional in the contract, and a search-only deployment is a
+first-class case rather than a degraded one.
 
 ## What it registers
 
@@ -25,9 +27,9 @@ orphans every Provider pointing at it as `(not installed)`.
 
 ## Requirements
 
-A reachable SearXNG instance with JSON output enabled and the bot limiter off —
-both are non-default, and without them every request from a non-browser client
-returns `403`:
+**SearXNG**, with JSON output enabled and the bot limiter off. Both are
+non-default, and without them every request from a non-browser client returns
+`403`:
 
 ```yaml
 # settings.yml
@@ -40,6 +42,19 @@ search:
     - html
     - json
 ```
+
+**A headless browser speaking CDP**, if you want `read_url`. Developed against
+[obscura](https://github.com/h4ckf0r0day/obscura), whose default container command
+is already `serve --port 9222 --host 0.0.0.0`; anything Chrome-protocol-compatible
+should work, since the client uses only `Target.createTarget`,
+`Target.attachToTarget`, `Page.enable`, `Page.navigate`, `Page.loadEventFired` and
+`Runtime.evaluate`.
+
+> **A CDP endpoint is arbitrary code execution in a browser.** Keep it on the
+> internal network and off the host's public interfaces — bind the host port to
+> loopback, or publish no host port at all. Note also that the plugin runs
+> in-process with the backend (ADR-0013), with its env and DB credentials: treat a
+> web backend like a dependency, not a sandbox.
 
 ## Install
 
@@ -80,22 +95,30 @@ Two details that decide whether this resolves:
 
 ```
 PLATYPUS_PLUGINS=@platypus/web-fetch,/app/plugins/searx/index.ts
-PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{"baseUrl":"http://searxng:8080"}}}
+PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{"baseUrl":"http://searxng:8080","browserUrl":"http://obscura:9222"}}}
 ```
 
 The plugin **list** takes whatever `import()` can resolve — a package specifier
 or a path. The **config object** is always keyed by the manifest name (`searx`).
 
-| Key          | Required | Default   | Meaning                                                                                                                                  |
-| ------------ | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `baseUrl`    | yes      | —         | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`. |
-| `language`   | no       | `all`     | SearXNG's language filter.                                                                                                               |
-| `categories` | no       | `general` | Comma-separated SearXNG categories.                                                                                                      |
+| Key          | Required | Default   | Meaning                                                                                                                                   |
+| ------------ | -------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`    | yes      | —         | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`.  |
+| `browserUrl` | no       | —         | CDP HTTP endpoint of a headless browser. Omit to contribute search only; no `read_url` tool is built and core substitutes nothing for it. |
+| `language`   | no       | `all`     | SearXNG's language filter.                                                                                                                |
+| `categories` | no       | `general` | Comma-separated SearXNG categories.                                                                                                       |
 
 Config is validated at boot and fails loud: malformed JSON, an unknown key or a
 non-URL `baseUrl` aborts startup with a plugin-named error. There are no secrets
 here — if a backend ever needs an API key it belongs in `credentials`, never in
 `config`.
+
+`browserUrl` is deliberately Operator config and never anything the model can
+influence. Core's egress guard covers the **model-supplied** URL handed to
+`read_url`; it does not cover this plugin's own call to the browser. Loopback is
+always blocked for the model, so a prompt-injected model asking to read
+`http://localhost:4000` is refused, while the plugin reaching the browser over the
+compose network is unaffected.
 
 Then select **SearXNG** under Provider → Advanced settings → Web-search backend.
 Native web search must stay **on**; until the two controls are collapsed into one,
@@ -103,9 +126,16 @@ switching it off disables the selected backend too.
 
 ## What core owns
 
-The backend supplies execution only. Core owns the tool schema and description,
-caps results to 10, truncates titles to 200 and snippets to 500 characters, drops
-any result whose URL is not `http(s)`, applies the timeout to both the factory and
-each call, and turns a thrown error into the model-facing error string. This
-plugin therefore returns every hit SearXNG gave it, untruncated, and throws on
-failure rather than returning an error shape.
+The backend supplies execution only. Core owns the tool schemas and descriptions,
+caps search results to 10, truncates titles to 200 and snippets to 500 characters,
+drops any result whose URL is not `http(s)`, caps `read_url` content at 1 000 000
+characters and does the `max_length` / `start_index` slicing with its continuation
+hint, runs the egress guard, applies `timeoutMs` to both the factory and each call,
+and turns a thrown error into the model-facing error string.
+
+So this plugin returns every hit SearXNG gave it and the page's full text, both
+untruncated, and throws on failure rather than returning an error shape.
+
+`timeoutMs` is 60 000 here — sized for a cold render, not for the metasearch, since
+the budget spans the factory and every call in the turn additively. The ceiling
+core enforces is 120 000, and exceeding it fails boot by name rather than clamping.

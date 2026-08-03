@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { renderPage } from "./cdp.ts";
 import type {
   PlatypusPlugin,
   PluginConfigContext,
+  WebBackendExecutors,
   WebSearchResult,
 } from "./types.ts";
 
@@ -12,14 +14,16 @@ import type {
 const PLUGIN_API_VERSION = 1;
 
 // A third-party Platypus Web-search backend (ADR-0014) backed by a self-hosted
-// SearXNG instance. Out of tree by design: core deliberately ships no backend,
-// so an Operator running vLLM/LiteLLM has no working chat search until a plugin
-// like this one is installed.
+// SearXNG instance, optionally paired with a headless browser (obscura) for page
+// reading. Out of tree by design: core deliberately ships no backend, so an
+// Operator running vLLM/LiteLLM has no working chat search until a plugin like
+// this one is installed.
 //
 // The manifest `name` below is the namespace core prefixes onto every
 // contribution id, so the bare `web` backend registers as `searx.web` — that is
 // the string stored in `provider.web_backend`. Renaming either half orphans
-// every Provider pointing at it, so both are fixed for good.
+// every Provider pointing at it, so both are fixed for good. The display name
+// carries no such weight and is free to change.
 
 const configSchema = z
   .object({
@@ -30,6 +34,11 @@ const configSchema = z
     language: z.string().default("all"),
     // Comma-separated SearXNG categories. `general` is the web index.
     categories: z.string().default("general"),
+    // CDP endpoint of a headless browser. Omit it and the backend contributes
+    // search only — `read_url` is optional in the contract and a search-only
+    // backend is a first-class case, so an Operator running no browser gets a
+    // working search rather than a broken reader.
+    browserUrl: z.string().url().optional(),
   })
   .strict();
 
@@ -70,15 +79,17 @@ export const plugin: PlatypusPlugin = {
       {
         backend: "web",
         name: "SearXNG",
-        // Generous for a LAN metasearch, and it covers the factory as well as
-        // every executor call in the turn, additively. Ceiling is 120_000.
-        timeoutMs: 15_000,
+        // A LAN metasearch needs a couple of seconds; a cold headless render of
+        // a heavy page needs far more. The budget covers the factory AND every
+        // executor call in the turn, additively, so it is sized for the reader
+        // rather than the searcher. Ceiling is 120_000.
+        timeoutMs: 60_000,
         createExecutors: (_ctx, plugin?: PluginConfigContext) => {
           // Boot-validated against `configSchema`, so the cast is safe: a
           // missing or malformed block aborts startup, it does not reach here.
           const config = plugin?.config as SearxConfig;
 
-          return {
+          const executors: WebBackendExecutors = {
             web_search: async ({ query }) => {
               const url = new URL("/search", config.baseUrl);
               url.searchParams.set("q", query);
@@ -123,6 +134,29 @@ export const plugin: PlatypusPlugin = {
               };
             },
           };
+
+          // Contributed only when a browser is configured. Core does not
+          // substitute anything for a missing `read_url` — by design, so
+          // leaving @platypus/web-fetch out of PLATYPUS_PLUGINS stays a real
+          // decision rather than one this plugin quietly reverses.
+          if (config.browserUrl) {
+            const browserUrl = config.browserUrl;
+            executors.read_url = async ({ url }) => {
+              // The URL is model-supplied and core has already run its egress
+              // guard on it. That guard does NOT cover this plugin's own call
+              // to the browser, which is why `browserUrl` is Operator config
+              // and never anything the model can influence.
+              const page = await renderPage(browserUrl, url, 45_000);
+              if (!page.content) {
+                throw new Error(
+                  `The browser rendered no readable text at ${page.url}`,
+                );
+              }
+              return page;
+            };
+          }
+
+          return executors;
         },
       },
     ],
