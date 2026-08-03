@@ -1,0 +1,21 @@
+{
+  "name": "@platypus-local/searx",
+  "version": "0.1.0",
+  "description": "Platypus Web-search backend backed by a self-hosted SearXNG instance.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "files": ["index.ts"],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@platypuschat/plugin-sdk": "workspace:*",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
