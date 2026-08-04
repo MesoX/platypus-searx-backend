@@ -177,3 +177,19 @@ with no CDP surface.
 `timeoutMs` is 60 000 here — sized for a cold render, not for the metasearch, since
 the budget spans the factory and every call in the turn additively. The ceiling
 core enforces is 120 000, and exceeding it fails boot by name rather than clamping.
+
+## License and credits
+
+MIT — see [LICENSE](LICENSE).
+
+`types.ts` reproduces the contract types verbatim from
+[`@platypuschat/plugin-sdk`](https://github.com/willdady/platypus/tree/main/packages/plugin-sdk)
+0.2.0, MIT, Copyright (c) 2026 Will Dady, so that the plugin needs no dependency
+on a package that is not yet on a public registry. Once the SDK is installable,
+delete that file and import the same names from the package.
+
+Built against the Web-search backend Extension point specified in
+[ADR-0014](https://github.com/willdady/platypus/blob/main/docs/adr/0014-web-search-backend-extension-point.md).
+[SearXNG](https://docs.searxng.org/) and
+[obscura](https://github.com/h4ckf0r0day/obscura) are separate projects under
+their own licenses; this plugin only talks to them over the network.

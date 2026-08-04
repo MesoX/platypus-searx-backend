@@ -8,7 +8,9 @@
 // reach, delete this file and import the same names from the package; the
 // shapes are copied verbatim from SDK 0.2.0.
 //
-// Copied from packages/plugin-sdk/index.ts @ 0.2.0.
+// Copied verbatim from packages/plugin-sdk/index.ts @ 0.2.0 in
+// https://github.com/willdady/platypus, used under its MIT license —
+// Copyright (c) 2026 Will Dady. The full notice is reproduced in LICENSE.
 
 export interface PluginConfigContext<
   TConfig = unknown,
