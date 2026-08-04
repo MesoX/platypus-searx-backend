@@ -1,16 +1,25 @@
 # @platypus-local/searx
 
-A Platypus **Web-search backend** (ADR-0014 Extension point): search through a
-self-hosted [SearXNG](https://docs.searxng.org/) instance, page reading through a
-headless browser over CDP.
+A Platypus **Web-search backend** (ADR-0014 Extension point), backed by two
+self-hosted services:
+
+|             | Service                                                                                                           | Fills        |
+| ----------- | ----------------------------------------------------------------------------------------------------------------- | ------------ |
+| **Search**  | [SearXNG](https://docs.searxng.org/) — a self-hosted metasearch engine                                            | `web_search` |
+| **Reading** | [obscura](https://github.com/h4ckf0r0day/obscura) — a Rust headless browser exposing the Chrome DevTools Protocol | `read_url`   |
 
 Platypus core deliberately ships no web-search backend, so a Provider pointed at
 a self-hosted OpenAI-compatible endpoint (vLLM, LiteLLM, SGLang) has a chat
-search toggle with nothing behind it. This plugin fills that slot.
+search toggle with nothing behind it. This plugin fills that slot with services
+you run yourself — no search API key, no third-party account, nothing leaving
+your network except the searches and page fetches themselves.
 
 `web_search` is always contributed. `read_url` appears only when `browserUrl` is
 configured — it is optional in the contract, and a search-only deployment is a
-first-class case rather than a degraded one.
+first-class case rather than a degraded one. obscura is what the reader was
+developed and measured against, but the client uses only standard CDP plus one
+optional obscura extension, so any Chrome-protocol browser works (see
+[What counts as the page](#what-the-plugin-owns-what-counts-as-the-page)).
 
 ## What it registers
 
@@ -27,28 +36,72 @@ orphans every Provider pointing at it as `(not installed)`.
 
 ## Requirements
 
-**SearXNG**, with JSON output enabled and the bot limiter off. Both are
-non-default, and without them every request from a non-browser client returns
-`403`:
+Both services need to be reachable from the **backend container** — on a compose
+network that means by service name, never `localhost`.
+
+### SearXNG
 
 ```yaml
-# settings.yml
+services:
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./searxng:/etc/searxng
+    networks: [platypus-network]
+    restart: unless-stopped
+```
+
+Two settings are **non-default and both required** — without them every request
+from a non-browser client returns `403`:
+
+```yaml
+# ./searxng/settings.yml
 use_default_settings: true
 server:
   secret_key: "<random>"
-  limiter: false
+  limiter: false # bot detection blocks non-browser clients
 search:
   formats:
     - html
-    - json
+    - json # off by default; this plugin needs it
 ```
 
-**A headless browser speaking CDP**, if you want `read_url`. Developed against
-[obscura](https://github.com/h4ckf0r0day/obscura), whose default container command
-is already `serve --port 9222 --host 0.0.0.0`; anything Chrome-protocol-compatible
-should work, since the client uses only `Target.createTarget`,
+### obscura (only if you want `read_url`)
+
+[obscura](https://github.com/h4ckf0r0day/obscura) is a Rust headless browser that
+runs real JavaScript via V8 and speaks the Chrome DevTools Protocol. Its published
+image already defaults to the right command, so the service needs no configuration
+at all:
+
+```yaml
+services:
+  obscura:
+    image: h4ckf0r0day/obscura:latest
+    command: ["serve", "--port", "9222", "--host", "0.0.0.0"]
+    networks: [platypus-network]
+    # Loopback only — see the warning below. Omit entirely if you never need to
+    # poke at it by hand.
+    ports:
+      - "127.0.0.1:9222:9222"
+    restart: unless-stopped
+```
+
+Verify it from inside the network, which is how the plugin sees it:
+
+```bash
+docker compose exec backend node -e \
+  "fetch('http://obscura:9222/json/version').then(r=>r.json()).then(v=>console.log(v.Browser))"
+# → Chrome/145.0.0.0
+```
+
+**Any Chrome-protocol browser works.** The client uses only `Target.createTarget`,
 `Target.attachToTarget`, `Page.enable`, `Page.navigate`, `Page.loadEventFired` and
-`Runtime.evaluate`.
+`Runtime.evaluate`, plus obscura's own `LP.getMarkdown` where available — and that
+one degrades to text extraction on `-32601 Unknown domain` rather than failing.
+Note that obscura exposes **no REST reader**: `serve` answers only `/json/version`,
+`/json/list` and `/json/protocol`, so CDP is the whole interface.
 
 > **A CDP endpoint is arbitrary code execution in a browser.** Keep it on the
 > internal network and off the host's public interfaces — bind the host port to
@@ -101,14 +154,14 @@ PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{"baseUrl":"http://searxng:8080","brow
 The plugin **list** takes whatever `import()` can resolve — a package specifier
 or a path. The **config object** is always keyed by the manifest name (`searx`).
 
-| Key                | Required | Default   | Meaning                                                                                                                                        |
-| ------------------ | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `baseUrl`          | yes      | —         | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`.       |
-| `browserUrl`       | no       | —         | CDP HTTP endpoint of a headless browser. Omit to contribute search only; no `read_url` tool is built and core substitutes nothing for it.      |
-| `readMode`         | no       | `text`    | `text` or `markdown`. Markdown keeps headings and link targets but measured ~3x larger on a news index page; text wins on prose per character. |
-| `pruneBoilerplate` | no       | `true`    | Strip non-content nodes and prefer an `<article>`/`<main>` before extracting.                                                                  |
-| `language`         | no       | `all`     | SearXNG's language filter.                                                                                                                     |
-| `categories`       | no       | `general` | Comma-separated SearXNG categories.                                                                                                            |
+| Key                | Required | Default    | Meaning                                                                                                                                                                 |
+| ------------------ | -------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`          | yes      | —          | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`.                                |
+| `browserUrl`       | no       | —          | CDP HTTP endpoint of a headless browser. Omit to contribute search only; no `read_url` tool is built and core substitutes nothing for it.                               |
+| `readMode`         | no       | `markdown` | `markdown` or `text`. Markdown is the only mode that carries link targets, so the model can follow a page instead of searching again; it costs 1.5x-6x more characters. |
+| `pruneBoilerplate` | no       | `true`     | Strip non-content nodes and prefer an `<article>`/`<main>` before extracting.                                                                                           |
+| `language`         | no       | `all`      | SearXNG's language filter.                                                                                                                                              |
+| `categories`       | no       | `general`  | Comma-separated SearXNG categories.                                                                                                                                     |
 
 Config is validated at boot and fails loud: malformed JSON, an unknown key or a
 non-URL `baseUrl` aborts startup with a plugin-named error. There are no secrets
@@ -168,7 +221,28 @@ Two distinct causes, both handled in `cdp.ts`:
 `markdown` mode uses obscura's **`LP.getMarkdown`**, a non-standard CDP domain, and
 falls back to text extraction on `-32601` — which is what keeps `browserUrl`
 pointable at plain headless Chrome. It takes no parameters, so the pruning above
-is the only way to scope what it converts.
+is the only way to scope what it converts. Links and image sources are resolved
+against the document **before** conversion: the converter emits the raw `href`
+attribute, which is relative on most sites, and core's `read_url` input is
+`z.string().url()` — so an unresolved link is one the model can see and cannot
+follow. Images become their alt text in `markdown` and are dropped in `text`; a
+model reading text cannot open a PNG, and a README's badge URLs are ~100
+characters each.
+
+That resolution is what decides the default:
+
+| Page                           | `markdown` | links | `text` | links |
+| ------------------------------ | ---------: | ----: | -----: | ----: |
+| a GitHub repository page       |      6,333 |    20 |  5,223 | **0** |
+| theguardian.com/world          |     15,002 |    40 |  6,390 | **0** |
+| edition.cnn.com                |     48,965 |   164 |  9,360 | **0** |
+| en.wikipedia.org/wiki/Platypus |    158,041 | 1,567 | 63,549 | **0** |
+
+Flat text renders an anchor as its label, so a model reading a page in `text`
+mode has to search again for every hop — and search snippets measure 120-160
+characters, enough to choose a link and never enough to answer. The extra
+characters are a budget the model can page through with `start_index`; a URL it
+never saw it cannot invent.
 
 Not solved: a homepage is genuinely mostly links (AP stays at 167 k), and
 real main-content extraction — obscura's `extract_readable_text` — is CLI/MCP-only
