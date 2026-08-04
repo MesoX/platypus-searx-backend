@@ -52,32 +52,80 @@ export type ReadMode = "markdown" | "text";
  * that ships an empty `<main>` and puts its content elsewhere — a wrong guess
  * there would throw the page away.
  */
-const PRUNE_JS = `
-  var strip = document.querySelectorAll(
-    "script, style, noscript, template, svg, iframe, form, button, select, " +
-    "link, meta, dialog, [aria-hidden='true'], [hidden]"
-  );
-  for (var i = 0; i < strip.length; i++) {
-    var n = strip[i];
-    if (n.parentNode) n.parentNode.removeChild(n);
-  }
+const pruneJs = (readMode: ReadMode): string => `
+  var IMAGES_AS_ALT = ${readMode === "markdown"};
 
-  var main = null;
-  var candidates = document.querySelectorAll("article, main, [role='main']");
-  for (var j = 0; j < candidates.length; j++) {
-    var text = candidates[j].textContent || "";
-    if (text.trim().length > 500) { main = candidates[j]; break; }
-  }
-
-  if (main && document.body) {
-    document.body.replaceChildren(main);
-  } else {
-    var chrome = document.querySelectorAll("nav, header, footer, aside");
-    for (var k = 0; k < chrome.length; k++) {
-      var c = chrome[k];
-      if (c.parentNode) c.parentNode.removeChild(c);
+  function drop(selector) {
+    var nodes = document.querySelectorAll(selector);
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
     }
   }
+
+  // Never content, and the source of the leakage: inline analytics, CSS, and
+  // JSON-LD all came back as page text.
+  drop(
+    "script, style, noscript, template, svg, iframe, form, button, select, " +
+    "textarea, link, meta, dialog, [aria-hidden='true'], [hidden]"
+  );
+
+  // Resolve every link and image against the document BEFORE extraction. The
+  // markdown converter reads the raw href attribute, which on most sites is
+  // relative ("/willdady/platypus/issues") — and core's read_url input is
+  // z.string().url(), so a relative href reaches the model as a link it cannot
+  // follow. The .href / .src properties are already absolute; copying them back
+  // onto the attributes is what makes a markdown page navigable.
+  var links = document.querySelectorAll("a[href]");
+  for (var li = 0; li < links.length; li++) {
+    try { links[li].setAttribute("href", links[li].href); } catch (e) {}
+  }
+  // An image src is unusable by definition — read_url hands text to a model
+  // that cannot open a PNG — and it is not cheap: a README's badges are
+  // ~100-character camo URLs and the markdown converter emits every one.
+  //
+  // What replaces it depends on the mode, because the two extractors disagree
+  // about images already. Markdown keeps the alt text: it is often the only
+  // label a badge link has, and dropping the image outright makes the converter
+  // discard the surrounding link as empty. Flat text drops them, because
+  // innerText never included them and injecting alt text there measured +67% on
+  // a news index for captions the prose does not need.
+  var imgs = document.querySelectorAll("img");
+  for (var ii = 0; ii < imgs.length; ii++) {
+    var img = imgs[ii];
+    if (!img.parentNode) continue;
+    var alt = IMAGES_AS_ALT ? (img.getAttribute("alt") || "").trim() : "";
+    img.parentNode.replaceChild(document.createTextNode(alt), img);
+  }
+
+  // Chrome landmarks go unconditionally, not just on the fallback path. A
+  // <main> usually contains the site's own nav (GitHub's repository tabs live
+  // inside it), so picking a landmark is not on its own enough to shed them.
+  drop("nav, header, footer, aside");
+
+  function biggest(selector) {
+    var nodes = document.querySelectorAll(selector);
+    var best = null, bestLen = 0, qualifying = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      var len = (nodes[i].textContent || "").trim().length;
+      if (len <= 500) continue;
+      qualifying++;
+      if (len > bestLen) { best = nodes[i]; bestLen = len; }
+    }
+    return { node: best, count: qualifying };
+  }
+
+  // <article> wins when the page marks up one or two of them, even when it is a
+  // small share of the text: on a repository page the README is the article and
+  // is 12% of the body, while <main> is 88% and mostly file lists. But an index
+  // page marks up every teaser as an <article>, and picking the largest teaser
+  // would throw the rest away — hence the count guard, not a size threshold.
+  var article = biggest("article");
+  var chosen =
+    article.node && article.count <= 2
+      ? article.node
+      : (biggest("[role='main']").node || biggest("main").node);
+
+  if (chosen && document.body) document.body.replaceChildren(chosen);
 `;
 
 /**
@@ -131,8 +179,24 @@ const readText = async (
     },
     sessionId,
   );
-  return evaluated(read) ?? "";
+  return normalise(evaluated(read) ?? "");
 };
+
+/**
+ * Collapses the whitespace this browser's `innerText` leaves behind — a
+ * repository page came back with runs of a dozen blank lines between two words.
+ * Core's default page is 5000 characters and it counts every one of them, so
+ * indentation the model cannot see is budget it cannot spend.
+ *
+ * Text mode only. Markdown is left alone: leading spaces are syntax there, and
+ * obscura's converter already collapses blank-line runs.
+ */
+const normalise = (text: string): string =>
+  text
+    .replace(/[ \t ]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
 const evaluated = (result: unknown): string | undefined => {
   const value = (result as { result?: { value?: unknown } } | undefined)?.result
@@ -338,7 +402,7 @@ export const renderPage = async (
         expression: `JSON.stringify((function () {
           var url = location.href;
           var contentType = document.contentType;
-          ${prune ? PRUNE_JS : ""}
+          ${prune ? pruneJs(readMode) : ""}
           return { url: url, contentType: contentType };
         })())`,
         returnByValue: true,

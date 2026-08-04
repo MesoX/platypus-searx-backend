@@ -39,12 +39,19 @@ const configSchema = z
     // backend is a first-class case, so an Operator running no browser gets a
     // working search rather than a broken reader.
     browserUrl: z.string().url().optional(),
-    // What a page is turned into. `text` by default for density: markdown
-    // carries every link target and image URL, which measured 3.2x larger than
-    // text on the same news index page — and core's default page is 5000
-    // characters, so that is two thirds less prose in the model's window.
-    // `markdown` when headings and followable links are worth the tokens.
-    readMode: z.enum(["markdown", "text"]).default("text"),
+    // What a page is turned into.
+    //
+    // `markdown` by default because it is the only mode that carries link
+    // targets: flat text renders an anchor as its label, so a model reading a
+    // page cannot follow anything on it and has to search again for every hop —
+    // and search snippets measure 120-160 characters, enough to choose a link
+    // and never enough to answer. Links are rewritten absolute before
+    // conversion (see cdp.ts), so they are usable as `read_url` input.
+    //
+    // It costs 1.5x-6x more characters than `text` for the same page. That is a
+    // budget the model can page through; a URL it never saw it cannot invent.
+    // `text` stays for deployments that would rather spend the context.
+    readMode: z.enum(["markdown", "text"]).default("markdown"),
     // Strip non-content nodes and prefer an `<article>`/`<main>` before
     // extracting. On by default: core's default page is 5000 characters, and on
     // a news homepage that budget is otherwise spent entirely on nav.
