@@ -28,6 +28,112 @@ export interface RenderedPage {
   contentType?: string;
 }
 
+/** `markdown` keeps headings and links; `text` is flat prose. */
+export type ReadMode = "markdown" | "text";
+
+/**
+ * Removes what is on the page but is not the page, in the document we are about
+ * to throw away.
+ *
+ * Two separate problems, both observed against real news sites:
+ *
+ * 1. **Non-content nodes leaking in as text.** `document.body.innerText` is
+ *    supposed to honour the UA stylesheet's `display: none` on `script`,
+ *    `style` and `noscript`. This browser's does not, so pages came back
+ *    starting with GTM `<noscript><iframe>` markup and inline analytics source.
+ *    Removing the nodes fixes it for every extractor rather than relying on one.
+ * 2. **Boilerplate crowding out the article.** Core's default page is 5000
+ *    characters. On a news homepage that is entirely nav, cookie banners and
+ *    section menus — the model pages through junk to reach the first sentence.
+ *    So: prefer an `<article>` / `<main>` when the page marks one up and it
+ *    holds real text, else drop the chrome landmarks.
+ *
+ * The 500-character floor on the chosen landmark is the guard against a site
+ * that ships an empty `<main>` and puts its content elsewhere — a wrong guess
+ * there would throw the page away.
+ */
+const PRUNE_JS = `
+  var strip = document.querySelectorAll(
+    "script, style, noscript, template, svg, iframe, form, button, select, " +
+    "link, meta, dialog, [aria-hidden='true'], [hidden]"
+  );
+  for (var i = 0; i < strip.length; i++) {
+    var n = strip[i];
+    if (n.parentNode) n.parentNode.removeChild(n);
+  }
+
+  var main = null;
+  var candidates = document.querySelectorAll("article, main, [role='main']");
+  for (var j = 0; j < candidates.length; j++) {
+    var text = candidates[j].textContent || "";
+    if (text.trim().length > 500) { main = candidates[j]; break; }
+  }
+
+  if (main && document.body) {
+    document.body.replaceChildren(main);
+  } else {
+    var chrome = document.querySelectorAll("nav, header, footer, aside");
+    for (var k = 0; k < chrome.length; k++) {
+      var c = chrome[k];
+      if (c.parentNode) c.parentNode.removeChild(c);
+    }
+  }
+`;
+
+/**
+ * Asks the browser for markdown via obscura's `LP.getMarkdown`, falling back to
+ * text if the method is not there.
+ *
+ * `LP` is obscura's own CDP domain, not a standard one, so any other
+ * Chrome-protocol browser answers `-32601 Unknown domain`. The fallback is what
+ * keeps `browserUrl` pointable at plain headless Chrome. It takes no params —
+ * hence the pruning above, which is the only way to scope what it converts.
+ */
+const readMarkdown = async (
+  cdp: CdpSession,
+  sessionId: string,
+): Promise<string> => {
+  try {
+    const result = (await cdp.send("LP.getMarkdown", {}, sessionId)) as {
+      markdown?: unknown;
+    };
+    if (typeof result?.markdown === "string" && result.markdown.length > 0) {
+      return result.markdown;
+    }
+    // An empty string is not an error — a genuinely blank page reads the same
+    // way — but there is nothing to lose by trying the other extractor.
+    return await readText(cdp, sessionId);
+  } catch {
+    return await readText(cdp, sessionId);
+  }
+};
+
+/**
+ * Flat text. `innerText` first because it respects layout (a table reads as
+ * rows, not as one run-on line), `textContent` only if the browser gives us
+ * nothing — after pruning, the difference no longer includes script bodies.
+ */
+const readText = async (
+  cdp: CdpSession,
+  sessionId: string,
+): Promise<string> => {
+  const read = await cdp.send(
+    "Runtime.evaluate",
+    {
+      expression: `(function () {
+        var root = document.body || document.documentElement;
+        if (!root) return "";
+        var t = root.innerText;
+        if (typeof t === "string" && t.trim().length > 0) return t;
+        return root.textContent || "";
+      })()`,
+      returnByValue: true,
+    },
+    sessionId,
+  );
+  return evaluated(read) ?? "";
+};
+
 const evaluated = (result: unknown): string | undefined => {
   const value = (result as { result?: { value?: unknown } } | undefined)?.result
     ?.value;
@@ -167,6 +273,8 @@ export const renderPage = async (
   browserUrl: string,
   pageUrl: string,
   timeoutMs: number,
+  readMode: ReadMode = "markdown",
+  prune = true,
 ): Promise<RenderedPage> => {
   const endpoint = new URL("/json/version", browserUrl);
   const response = await fetch(endpoint, {
@@ -221,32 +329,44 @@ export const renderPage = async (
     }
     await loaded;
 
-    // One round trip for all three: a second navigation cannot slip in between
-    // the text and the URL it is supposed to belong to.
-    const read = await cdp.send(
+    // Prune first, then extract. Both the metadata and the pruning ride one
+    // round trip, so the URL cannot belong to a different navigation than the
+    // content — and the extractor below sees an already-pruned DOM.
+    const meta = await cdp.send(
       "Runtime.evaluate",
       {
-        expression: `JSON.stringify({
-          content: document.body ? document.body.innerText : "",
-          url: location.href,
-          contentType: document.contentType
-        })`,
+        expression: `JSON.stringify((function () {
+          var url = location.href;
+          var contentType = document.contentType;
+          ${prune ? PRUNE_JS : ""}
+          return { url: url, contentType: contentType };
+        })())`,
         returnByValue: true,
       },
       sessionId,
     );
+    const metaRaw = evaluated(meta);
+    const parsedMeta = metaRaw
+      ? (JSON.parse(metaRaw) as { url?: unknown; contentType?: unknown })
+      : {};
 
-    const raw = evaluated(read);
-    if (!raw) throw new Error("Browser returned no page content");
-    const page = JSON.parse(raw) as RenderedPage;
+    const content =
+      readMode === "markdown"
+        ? await readMarkdown(cdp, sessionId)
+        : await readText(cdp, sessionId);
 
     return {
-      // Full text: core caps it and owns max_length / start_index slicing.
-      content: typeof page.content === "string" ? page.content : "",
+      // Full content: core caps it and owns max_length / start_index slicing.
+      content,
       // Post-redirect final URL, so the model cites where it actually landed.
-      url: typeof page.url === "string" && page.url ? page.url : pageUrl,
+      url:
+        typeof parsedMeta.url === "string" && parsedMeta.url
+          ? parsedMeta.url
+          : pageUrl,
       contentType:
-        typeof page.contentType === "string" ? page.contentType : undefined,
+        typeof parsedMeta.contentType === "string"
+          ? parsedMeta.contentType
+          : undefined,
     };
   } finally {
     if (targetId) {

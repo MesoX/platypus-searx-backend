@@ -101,12 +101,14 @@ PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{"baseUrl":"http://searxng:8080","brow
 The plugin **list** takes whatever `import()` can resolve — a package specifier
 or a path. The **config object** is always keyed by the manifest name (`searx`).
 
-| Key          | Required | Default   | Meaning                                                                                                                                   |
-| ------------ | -------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `baseUrl`    | yes      | —         | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`.  |
-| `browserUrl` | no       | —         | CDP HTTP endpoint of a headless browser. Omit to contribute search only; no `read_url` tool is built and core substitutes nothing for it. |
-| `language`   | no       | `all`     | SearXNG's language filter.                                                                                                                |
-| `categories` | no       | `general` | Comma-separated SearXNG categories.                                                                                                       |
+| Key                | Required | Default   | Meaning                                                                                                                                        |
+| ------------------ | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`          | yes      | —         | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`.       |
+| `browserUrl`       | no       | —         | CDP HTTP endpoint of a headless browser. Omit to contribute search only; no `read_url` tool is built and core substitutes nothing for it.      |
+| `readMode`         | no       | `text`    | `text` or `markdown`. Markdown keeps headings and link targets but measured ~3x larger on a news index page; text wins on prose per character. |
+| `pruneBoilerplate` | no       | `true`    | Strip non-content nodes and prefer an `<article>`/`<main>` before extracting.                                                                  |
+| `language`         | no       | `all`     | SearXNG's language filter.                                                                                                                     |
+| `categories`       | no       | `general` | Comma-separated SearXNG categories.                                                                                                            |
 
 Config is validated at boot and fails loud: malformed JSON, an unknown key or a
 non-URL `baseUrl` aborts startup with a plugin-named error. There are no secrets
@@ -135,6 +137,42 @@ and turns a thrown error into the model-facing error string.
 
 So this plugin returns every hit SearXNG gave it and the page's full text, both
 untruncated, and throws on failure rather than returning an error shape.
+
+### What the plugin owns: what counts as the page
+
+Extraction is the backend's job, not core's, and the choice is load-bearing —
+core's default page is 5000 characters, so whatever comes out first is most of
+what the model ever sees. Measured on the same four news URLs:
+
+| Page                  | `innerText`, unpruned | `text` + prune |
+| --------------------- | --------------------: | -------------: |
+| edition.cnn.com       |             2,008,031 |         48,962 |
+| apnews.com            |               416,189 |        167,944 |
+| theguardian.com/world |                18,157 |          6,569 |
+| an NPR article        |                16,290 |          7,379 |
+
+Two distinct causes, both handled in `cdp.ts`:
+
+1. **Non-content nodes arriving as text.** `document.body.innerText` is supposed
+   to honour `display: none` on `script` / `style` / `noscript`; obscura's does
+   not, so pages came back beginning with Google Tag Manager `<noscript><iframe>`
+   markup and inline analytics source. CNN's 2 MB was mostly that. The nodes are
+   removed before extraction, which fixes it for either `readMode` — obscura's
+   own markdown converter already skips them, but relying on that would leave
+   `text` broken.
+2. **Boilerplate ahead of the article.** An `<article>` / `<main>` carrying more
+   than 500 characters replaces the body; failing that, `nav` / `header` /
+   `footer` / `aside` are dropped. The 500-character floor guards against a site
+   that ships an empty landmark and puts its content elsewhere.
+
+`markdown` mode uses obscura's **`LP.getMarkdown`**, a non-standard CDP domain, and
+falls back to text extraction on `-32601` — which is what keeps `browserUrl`
+pointable at plain headless Chrome. It takes no parameters, so the pruning above
+is the only way to scope what it converts.
+
+Not solved: a homepage is genuinely mostly links (AP stays at 167 k), and
+real main-content extraction — obscura's `extract_readable_text` — is CLI/MCP-only
+with no CDP surface.
 
 `timeoutMs` is 60 000 here — sized for a cold render, not for the metasearch, since
 the budget spans the factory and every call in the turn additively. The ceiling

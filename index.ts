@@ -39,6 +39,16 @@ const configSchema = z
     // backend is a first-class case, so an Operator running no browser gets a
     // working search rather than a broken reader.
     browserUrl: z.string().url().optional(),
+    // What a page is turned into. `text` by default for density: markdown
+    // carries every link target and image URL, which measured 3.2x larger than
+    // text on the same news index page — and core's default page is 5000
+    // characters, so that is two thirds less prose in the model's window.
+    // `markdown` when headings and followable links are worth the tokens.
+    readMode: z.enum(["markdown", "text"]).default("text"),
+    // Strip non-content nodes and prefer an `<article>`/`<main>` before
+    // extracting. On by default: core's default page is 5000 characters, and on
+    // a news homepage that budget is otherwise spent entirely on nav.
+    pruneBoilerplate: z.boolean().default(true),
   })
   .strict();
 
@@ -146,7 +156,13 @@ export const plugin: PlatypusPlugin = {
               // guard on it. That guard does NOT cover this plugin's own call
               // to the browser, which is why `browserUrl` is Operator config
               // and never anything the model can influence.
-              const page = await renderPage(browserUrl, url, 45_000);
+              const page = await renderPage(
+                browserUrl,
+                url,
+                45_000,
+                config.readMode,
+                config.pruneBoilerplate,
+              );
               if (!page.content) {
                 throw new Error(
                   `The browser rendered no readable text at ${page.url}`,
