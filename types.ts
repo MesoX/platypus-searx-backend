@@ -10,7 +10,7 @@
 //
 // Copied verbatim from packages/plugin-sdk/index.ts @ 0.2.0 in
 // https://github.com/willdady/platypus, used under its MIT license —
-// Copyright (c) 2026 Will Dady. The full notice is reproduced in LICENSE.
+// Copyright (c) 2026 Will Dady. The full notice is reproduced in NOTICE.
 
 export interface PluginConfigContext<
   TConfig = unknown,

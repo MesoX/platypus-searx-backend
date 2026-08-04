@@ -180,7 +180,7 @@ core enforces is 120 000, and exceeding it fails boot by name rather than clampi
 
 ## License and credits
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Third-party notices are in [NOTICE](NOTICE).
 
 `types.ts` reproduces the contract types verbatim from
 [`@platypuschat/plugin-sdk`](https://github.com/willdady/platypus/tree/main/packages/plugin-sdk)
