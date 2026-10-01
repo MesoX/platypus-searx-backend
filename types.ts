@@ -6,11 +6,22 @@
 // no workspace membership, no lockfile entry, nothing added to the Platypus
 // repo. Once `@platypuschat/plugin-sdk` is on a registry the deployment can
 // reach, delete this file and import the same names from the package; the
-// shapes are copied verbatim from SDK 0.2.0.
+// shapes are copied verbatim from SDK 2.2.0.
 //
-// Copied verbatim from packages/plugin-sdk/index.ts @ 0.2.0 in
+// Copied verbatim from packages/plugin-sdk/index.ts @ 2.2.0 in
 // https://github.com/willdady/platypus, used under its MIT license —
 // Copyright (c) 2026 Will Dady. The full notice is reproduced in NOTICE.
+
+export interface PluginLogger {
+  debug(obj: object, msg?: string): void;
+  debug(msg: string): void;
+  info(obj: object, msg?: string): void;
+  info(msg: string): void;
+  warn(obj: object, msg?: string): void;
+  warn(msg: string): void;
+  error(obj: object, msg?: string): void;
+  error(msg: string): void;
+}
 
 export interface PluginConfigContext<
   TConfig = unknown,
@@ -18,12 +29,16 @@ export interface PluginConfigContext<
 > {
   config: TConfig;
   credentials: TCredentials;
+  logger: PluginLogger;
 }
+
+export type CloserRegistrar = (close: () => Promise<void> | void) => void;
 
 export interface WebBackendContext {
   orgId: string;
   workspaceId: string;
   userId: string;
+  registerCloser: CloserRegistrar;
 }
 
 /** One search hit. Core caps the count and truncates the strings (ADR-0014). */
@@ -45,11 +60,19 @@ export interface ReadUrlResult {
   contentType?: string;
 }
 
+export interface WebExecutorOptions {
+  signal: AbortSignal;
+}
+
 export interface WebBackendExecutors {
-  web_search: (input: {
-    query: string;
-  }) => Promise<WebSearchResults> | WebSearchResults;
-  read_url?: (input: { url: string }) => Promise<ReadUrlResult> | ReadUrlResult;
+  web_search: (
+    input: { query: string },
+    options: WebExecutorOptions,
+  ) => Promise<WebSearchResults> | WebSearchResults;
+  read_url?: (
+    input: { url: string },
+    options: WebExecutorOptions,
+  ) => Promise<ReadUrlResult> | ReadUrlResult;
 }
 
 export interface WebBackendContribution {
@@ -61,7 +84,7 @@ export interface WebBackendContribution {
   timeoutMs?: number;
   createExecutors(
     ctx: WebBackendContext,
-    plugin?: PluginConfigContext,
+    plugin: PluginConfigContext,
   ): WebBackendExecutors | Promise<WebBackendExecutors>;
 }
 

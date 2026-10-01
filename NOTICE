@@ -2,7 +2,7 @@ Third-party notices for @platypus-local/searx
 =============================================
 
 types.ts contains type declarations copied verbatim from
-@platypuschat/plugin-sdk 0.2.0 — https://github.com/willdady/platypus,
+@platypuschat/plugin-sdk 2.2.0 — https://github.com/willdady/platypus,
 packages/plugin-sdk — used under its MIT license and reproduced here so the
 plugin needs no dependency on a package that is not yet on a public registry.
 

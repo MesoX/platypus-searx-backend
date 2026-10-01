@@ -7,11 +7,14 @@ import type {
   WebSearchResult,
 } from "./types.ts";
 
-// The API major this manifest targets (ADR-0013: apiVersion is majors-only, and
-// core accepts N and N-1). Inlined rather than imported from
-// @platypuschat/plugin-sdk so the plugin's only runtime dependency is zod — see
-// types.ts for why the SDK is a type-only dependency here.
-const PLUGIN_API_VERSION = 1;
+// The minimum API major this manifest needs (ADR-0013: apiVersion is majors-only,
+// and core accepts N and N-1). 2, not 3: v3 only re-signs Sandbox backends, so a
+// Web-search backend gains nothing from it, and 2 keeps the plugin loadable on a
+// v2 core too. A v1 core (before upstream db2d342b) refuses it at boot. Inlined
+// rather than imported from @platypuschat/plugin-sdk so the plugin's only
+// runtime dependency is zod — see types.ts for why the SDK is a type-only
+// dependency here.
+const PLUGIN_API_VERSION = 2;
 
 // A third-party Platypus Web-search backend (ADR-0014) backed by a self-hosted
 // SearXNG instance, optionally paired with a headless browser (obscura) for page
@@ -21,7 +24,7 @@ const PLUGIN_API_VERSION = 1;
 //
 // The manifest `name` below is the namespace core prefixes onto every
 // contribution id, so the bare `web` backend registers as `searx.web` — that is
-// the string stored in `provider.web_backend`. Renaming either half orphans
+// the string stored in `provider.search_source`. Renaming either half orphans
 // every Provider pointing at it, so both are fixed for good. The display name
 // carries no such weight and is free to change.
 
@@ -101,21 +104,25 @@ export const plugin: PlatypusPlugin = {
         // executor call in the turn, additively, so it is sized for the reader
         // rather than the searcher. Ceiling is 120_000.
         timeoutMs: 60_000,
-        createExecutors: (_ctx, plugin?: PluginConfigContext) => {
-          // Boot-validated against `configSchema`, so the cast is safe: a
-          // missing or malformed block aborts startup, it does not reach here.
-          const config = plugin?.config as SearxConfig;
+        // Typed as `SearxConfig` rather than cast: core boot-validates the
+        // block against `configSchema`, so a missing or malformed one aborts
+        // startup and never reaches here.
+        createExecutors: (_ctx, plugin: PluginConfigContext<SearxConfig>) => {
+          const config = plugin.config;
 
           const executors: WebBackendExecutors = {
-            web_search: async ({ query }) => {
+            web_search: async ({ query }, { signal }) => {
               const url = new URL("/search", config.baseUrl);
               url.searchParams.set("q", query);
               url.searchParams.set("format", "json");
               url.searchParams.set("language", config.language);
               url.searchParams.set("categories", config.categories);
 
+              // `signal` fires on cancel or when `timeoutMs` passes, so the
+              // request stops when core stops waiting for it.
               const response = await fetch(url, {
                 headers: { Accept: "application/json" },
+                signal,
               });
               // Throw rather than returning an error shape: core catches it,
               // turns it into the model-facing error string and logs the cause.
@@ -158,7 +165,7 @@ export const plugin: PlatypusPlugin = {
           // decision rather than one this plugin quietly reverses.
           if (config.browserUrl) {
             const browserUrl = config.browserUrl;
-            executors.read_url = async ({ url }) => {
+            executors.read_url = async ({ url }, { signal }) => {
               // The URL is model-supplied and core has already run its egress
               // guard on it. That guard does NOT cover this plugin's own call
               // to the browser, which is why `browserUrl` is Operator config
@@ -169,6 +176,7 @@ export const plugin: PlatypusPlugin = {
                 45_000,
                 config.readMode,
                 config.pruneBoilerplate,
+                signal,
               );
               if (!page.content) {
                 throw new Error(

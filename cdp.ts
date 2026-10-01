@@ -304,25 +304,38 @@ class CdpSession {
   }
 }
 
-const openSocket = (url: string, timeoutMs: number): Promise<WebSocket> =>
+const openSocket = (
+  url: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<WebSocket> =>
   new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
     const socket = new WebSocket(url);
-    const timer = setTimeout(() => {
+    const giveUp = (cause: unknown) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       try {
         socket.close();
       } catch {
         /* nothing to do */
       }
-      reject(new Error("CDP connection timed out"));
-    }, timeoutMs);
+      reject(cause);
+    };
+    // Closed here rather than raced from outside: a socket that opened after
+    // the caller stopped waiting would have no one left to close it.
+    const onAbort = () => giveUp(signal.reason);
+    const timer = setTimeout(
+      () => giveUp(new Error("CDP connection timed out")),
+      timeoutMs,
+    );
+    signal.addEventListener("abort", onAbort, { once: true });
     socket.onopen = () => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       resolve(socket);
     };
-    socket.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error("CDP connection failed"));
-    };
+    socket.onerror = () => giveUp(new Error("CDP connection failed"));
   });
 
 /**
@@ -332,17 +345,25 @@ const openSocket = (url: string, timeoutMs: number): Promise<WebSocket> =>
  * `/json/version` advertises a WebSocket URL with a loopback authority — correct
  * from inside the browser's own container, useless from another one — so the
  * authority is rewritten to the one we dialled.
+ *
+ * `signal` is core's: it fires when the turn is cancelled or the backend's
+ * `timeoutMs` passes. The render then stops at its next step, and the tab it
+ * opened is still closed — an abandoned read must not leave a page loading in
+ * the browser.
  */
 export const renderPage = async (
   browserUrl: string,
   pageUrl: string,
   timeoutMs: number,
-  readMode: ReadMode = "markdown",
-  prune = true,
+  readMode: ReadMode,
+  prune: boolean,
+  signal: AbortSignal,
 ): Promise<RenderedPage> => {
+  signal.throwIfAborted();
+
   const endpoint = new URL("/json/version", browserUrl);
   const response = await fetch(endpoint, {
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
   });
   if (!response.ok) {
     throw new Error(
@@ -361,63 +382,83 @@ export const renderPage = async (
   advertised.protocol = dialled.protocol === "https:" ? "wss:" : "ws:";
   advertised.host = dialled.host;
 
-  const socket = await openSocket(advertised.href, timeoutMs);
+  const socket = await openSocket(advertised.href, timeoutMs, signal);
   const cdp = new CdpSession(socket, timeoutMs);
+
+  // Each step below is raced against the abort, so a cancelled read stops
+  // waiting at once. The socket deliberately stays open through it: `finally`
+  // still needs it to close the tab.
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    // An abort that landed between awaits has already fired its event.
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  aborted.catch(() => {}); // Observed by the races; never unhandled.
+  const step = <T>(work: Promise<T>): Promise<T> =>
+    Promise.race([work, aborted]);
 
   let targetId: string | undefined;
   try {
+    // Not raced: a target created after we stopped waiting would come back
+    // with an id nobody holds, and stay open. Let it land, then check.
     const target = (await cdp.send("Target.createTarget", {
       url: "about:blank",
     })) as { targetId?: string };
     targetId = target?.targetId;
     if (!targetId) throw new Error("Browser did not open a page target");
+    signal.throwIfAborted();
 
-    const attached = (await cdp.send("Target.attachToTarget", {
-      targetId,
-      flatten: true,
-    })) as { sessionId?: string };
+    const attached = (await step(
+      cdp.send("Target.attachToTarget", {
+        targetId,
+        flatten: true,
+      }),
+    )) as { sessionId?: string };
     const sessionId = attached?.sessionId;
     if (!sessionId)
       throw new Error("Browser did not attach to the page target");
 
-    await cdp.send("Page.enable", {}, sessionId);
+    await step(cdp.send("Page.enable", {}, sessionId));
     // Arm the load waiter before navigating, or a fast page fires it first.
     const loaded = cdp.waitFor("Page.loadEventFired", sessionId, timeoutMs);
-    const navigation = (await cdp.send(
-      "Page.navigate",
-      { url: pageUrl },
-      sessionId,
+    const navigation = (await step(
+      cdp.send("Page.navigate", { url: pageUrl }, sessionId),
     )) as { errorText?: string };
     if (navigation?.errorText) {
       throw new Error(`Navigation failed: ${navigation.errorText}`);
     }
-    await loaded;
+    await step(loaded);
 
     // Prune first, then extract. Both the metadata and the pruning ride one
     // round trip, so the URL cannot belong to a different navigation than the
     // content — and the extractor below sees an already-pruned DOM.
-    const meta = await cdp.send(
-      "Runtime.evaluate",
-      {
-        expression: `JSON.stringify((function () {
+    const meta = await step(
+      cdp.send(
+        "Runtime.evaluate",
+        {
+          expression: `JSON.stringify((function () {
           var url = location.href;
           var contentType = document.contentType;
           ${prune ? pruneJs(readMode) : ""}
           return { url: url, contentType: contentType };
         })())`,
-        returnByValue: true,
-      },
-      sessionId,
+          returnByValue: true,
+        },
+        sessionId,
+      ),
     );
     const metaRaw = evaluated(meta);
     const parsedMeta = metaRaw
       ? (JSON.parse(metaRaw) as { url?: unknown; contentType?: unknown })
       : {};
 
-    const content =
+    const content = await step(
       readMode === "markdown"
-        ? await readMarkdown(cdp, sessionId)
-        : await readText(cdp, sessionId);
+        ? readMarkdown(cdp, sessionId)
+        : readText(cdp, sessionId),
+    );
 
     return {
       // Full content: core caps it and owns max_length / start_index slicing.
@@ -433,6 +474,7 @@ export const renderPage = async (
           : undefined,
     };
   } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
     if (targetId) {
       // A target left open is a page the browser keeps running. Best-effort:
       // the read already succeeded or failed, and neither outcome improves by

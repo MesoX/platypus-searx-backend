@@ -23,12 +23,14 @@ optional obscura extension, so any Chrome-protocol browser works (see
 
 ## What it registers
 
-|                                              |                               |
-| -------------------------------------------- | ----------------------------- |
-| Entry for `PLATYPUS_PLUGINS`                 | `/app/plugins/searx/index.ts` |
-| Manifest name (for `PLATYPUS_PLUGIN_CONFIG`) | `searx`                       |
-| Backend id (stored in `provider.webBackend`) | `searx.web`                   |
-| Display name                                 | SearXNG                       |
+|                                                |                                |
+| ---------------------------------------------- | ------------------------------ |
+| Entry for `PLATYPUS_PLUGINS`                   | `/app/plugins/searx/index.ts`  |
+| Manifest name (names the config variable)      | `searx`                        |
+| Config variable                                | `PLATYPUS_PLUGIN_CONFIG_SEARX` |
+| Plugin API                                     | v2 (core accepting v2 or v3)   |
+| Backend id (stored in `provider.searchSource`) | `searx.web`                    |
+| Display name                                   | SearXNG                        |
 
 The backend id is what gets persisted on the Provider row, so the manifest `name`
 and the contribution's bare `backend` are both fixed for good — renaming either
@@ -148,11 +150,18 @@ Two details that decide whether this resolves:
 
 ```
 PLATYPUS_PLUGINS=@platypus/web-fetch,/app/plugins/searx/index.ts
-PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{"baseUrl":"http://searxng:8080","browserUrl":"http://obscura:9222"}}}
+PLATYPUS_PLUGIN_CONFIG_SEARX={"config":{"baseUrl":"http://searxng:8080","browserUrl":"http://obscura:9222"}}
 ```
 
 The plugin **list** takes whatever `import()` can resolve — a package specifier
-or a path. The **config object** is always keyed by the manifest name (`searx`).
+or a path. The **config variable** is named after the manifest name (`searx` →
+`PLATYPUS_PLUGIN_CONFIG_SEARX`), never the path. The older combined
+`PLATYPUS_PLUGIN_CONFIG={"searx":{"config":{…}}}` still works on current core
+but is deprecated.
+
+**Core compatibility.** The manifest declares plugin API **v2**, so it loads on a
+core whose window covers v2 (today `[2, 3]`). A core from before upstream
+`db2d342b` accepts only v1 and refuses it at boot — run tag `v1-api-last` there.
 
 | Key                | Required | Default    | Meaning                                                                                                                                                                 |
 | ------------------ | -------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -175,9 +184,9 @@ always blocked for the model, so a prompt-injected model asking to read
 `http://localhost:4000` is refused, while the plugin reaching the browser over the
 compose network is unaffected.
 
-Then select **SearXNG** under Provider → Advanced settings → Web-search backend.
-Native web search must stay **on**; until the two controls are collapsed into one,
-switching it off disables the selected backend too.
+Then select **SearXNG (searx)** under Provider → Advanced settings → Web search.
+It is one select — None, the provider's built-in search, or an installed backend —
+so choosing SearXNG replaces the provider's own search for that Provider.
 
 ## What core owns
 
@@ -258,7 +267,7 @@ MIT — see [LICENSE](LICENSE). Third-party notices are in [NOTICE](NOTICE).
 
 `types.ts` reproduces the contract types verbatim from
 [`@platypuschat/plugin-sdk`](https://github.com/willdady/platypus/tree/main/packages/plugin-sdk)
-0.2.0, MIT, Copyright (c) 2026 Will Dady, so that the plugin needs no dependency
+2.2.0, MIT, Copyright (c) 2026 Will Dady, so that the plugin needs no dependency
 on a package that is not yet on a public registry. Once the SDK is installable,
 delete that file and import the same names from the package.
 
