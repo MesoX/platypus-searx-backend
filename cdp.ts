@@ -31,6 +31,17 @@ export interface RenderedPage {
 /** `markdown` keeps headings and links; `text` is flat prose. */
 export type ReadMode = "markdown" | "text";
 
+/** A heading as the pruned DOM has it — text mode has no heading syntax to parse. */
+export interface Heading {
+  level: number;
+  text: string;
+}
+
+/** The page before shaping: what the browser gave us, plus its DOM headings. */
+export interface ExtractedPage extends RenderedPage {
+  headings: Heading[];
+}
+
 /**
  * Removes what is on the page but is not the page, in the document we are about
  * to throw away.
@@ -145,9 +156,11 @@ const readMarkdown = async (
     const result = (await cdp.send("LP.getMarkdown", {}, sessionId)) as {
       markdown?: unknown;
     };
-    if (typeof result?.markdown === "string" && result.markdown.length > 0) {
-      return result.markdown;
-    }
+    const markdown =
+      typeof result?.markdown === "string"
+        ? normaliseMarkdown(result.markdown)
+        : "";
+    if (markdown.length > 0) return markdown;
     // An empty string is not an error — a genuinely blank page reads the same
     // way — but there is nothing to lose by trying the other extractor.
     return await readText(cdp, sessionId);
@@ -188,8 +201,8 @@ const readText = async (
  * Core's default page is 5000 characters and it counts every one of them, so
  * indentation the model cannot see is budget it cannot spend.
  *
- * Text mode only. Markdown is left alone: leading spaces are syntax there, and
- * obscura's converter already collapses blank-line runs.
+ * Text mode. Markdown has its own pass below, because indentation means
+ * something inside a code fence.
  */
 const normalise = (text: string): string =>
   text
@@ -198,10 +211,278 @@ const normalise = (text: string): string =>
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-const evaluated = (result: unknown): string | undefined => {
+/**
+ * The markdown counterpart of `normalise`. obscura's converter copies text
+ * nodes verbatim, so the site's own source indentation comes through: lines of
+ * nothing but tabs, which its blank-line collapsing does not see as blank. On
+ * CNN they were over half of the first 5000 characters.
+ *
+ * The converter never starts its own syntax with whitespace — headings, list
+ * items, quotes, table rows and fences all begin at column 0 — so outside a
+ * fence a line's surrounding whitespace is never markdown and goes, and runs
+ * inside it collapse as HTML would render them. Inside a fence indentation is
+ * the content, so only trailing whitespace goes there.
+ */
+export const normaliseMarkdown = (markdown: string): string => {
+  let fenced = false;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("```")) {
+        fenced = !fenced;
+        return line.trimEnd();
+      }
+      return fenced
+        ? line.trimEnd()
+        : line.replace(/[ \t ]+/g, " ").trim();
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+};
+
+const evaluated =(result: unknown): string | undefined => {
   const value = (result as { result?: { value?: unknown } } | undefined)?.result
     ?.value;
   return typeof value === "string" ? value : undefined;
+};
+
+// --- Shaping: making core's first page worth reading -----------------------
+//
+// Core serves read_url in pages — `max_length` defaults to 5000 characters and
+// the rest is reached with `start_index`. Models mostly take the default, so the
+// first 5000 characters decide what a read is worth. Two things spend them badly:
+//
+// 1. **Link targets.** obscura's converter writes every anchor inline as
+//    `[label](https://…)`, and the URL is usually longer than the label. On a
+//    link-dense page most of the first page is URLs.
+// 2. **No sense of the rest.** A model reading characters 0-5000 of a 150 000
+//    character page cannot tell which `start_index` holds what it came for, so
+//    it either stops or pages blindly.
+//
+// So markdown links become references collected in a footer, and a long page
+// opens with a map of its headings and where the footer starts. Neither drops
+// content: every label stays where it was, every distinct target is still
+// listed, and the map only adds offsets.
+
+/** Core's default `read_url` page — `max_length`'s default. */
+const DEFAULT_PAGE_CHARS = 5_000;
+/** The most of the first page the map may take. */
+const MAP_BUDGET_CHARS = 1_200;
+const MAP_HEADING_CHARS = 80;
+
+// The converter emits `'[' + label.trim() + '](' + href + ')'` with no escaping,
+// so the label may hold one level of brackets (Wikipedia's `[[1]](…)` citation
+// links) and the URL may hold balanced parentheses (`/wiki/Foo_(bar)`). URLs
+// never hold whitespace — pruning copied `.href`, which is already serialised.
+// Each alternation starts on a distinct character, so matching stays linear.
+const INLINE_LINK =
+  /\[((?:[^[\]]|\[[^[\]]*\])*)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))*)\)/g;
+const REFERENCE_LINK = /\[((?:[^[\]]|\[[^[\]]*\])*)\]\[L\d+\]/g;
+
+const withoutFragment = (url: string): string => {
+  const hash = url.indexOf("#");
+  return hash < 0 ? url : url.slice(0, hash);
+};
+
+/**
+ * `[label](url)` → `[label][Ln]`, with `[Ln]: url` collected in a footer, one
+ * per distinct target in order of first use.
+ *
+ * The `L` is load-bearing: pages keep their own bracketed numbers as text —
+ * Wikipedia's `[1]` citation markers survive as labels — and a bare `[1]` is
+ * markdown's shortcut syntax for definition `[1]`. Numeric ids would make every
+ * footnote marker read as a link to some unrelated target.
+ *
+ * Links back into the same document become their label alone. They cannot be
+ * followed to anything new — `read_url` on them returns this page again — and
+ * they are not rare: Wikipedia's citation markers alone are hundreds per article.
+ */
+const toReferenceLinks = (
+  markdown: string,
+  pageUrl: string,
+): { body: string; footer: string; count: number } => {
+  const page = withoutFragment(pageUrl);
+  const ids = new Map<string, number>();
+  const body = markdown.replace(
+    INLINE_LINK,
+    (_match, label: string, url: string) => {
+      if (withoutFragment(url) === page) return label;
+      let id = ids.get(url);
+      if (id === undefined) {
+        id = ids.size + 1;
+        ids.set(url, id);
+      }
+      return `[${label}][L${id}]`;
+    },
+  );
+  if (ids.size === 0) return { body, footer: "", count: 0 };
+  const definitions = [...ids].map(([url, id]) => `[L${id}]: ${url}`);
+  return {
+    body,
+    footer: `\n\n---\nLinks:\n${definitions.join("\n")}`,
+    count: ids.size,
+  };
+};
+
+interface MapEntry {
+  offset: number;
+  level: number;
+  text: string;
+}
+
+const plainHeading = (text: string): string => {
+  const plain = text
+    .replace(REFERENCE_LINK, "$1")
+    .replace(INLINE_LINK, "$1")
+    .replace(/[*`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return plain.length > MAP_HEADING_CHARS
+    ? `${plain.slice(0, MAP_HEADING_CHARS - 1)}…`
+    : plain;
+};
+
+/** ATX headings, outside fenced code — the converter emits nothing else. */
+const markdownHeadings = (markdown: string): MapEntry[] => {
+  const entries: MapEntry[] = [];
+  let offset = 0;
+  let fenced = false;
+  for (const line of markdown.split("\n")) {
+    if (line.startsWith("```")) fenced = !fenced;
+    const match = fenced ? null : /^(#{1,6}) (.*\S)/.exec(line);
+    if (match) {
+      const text = plainHeading(match[2]);
+      if (text) entries.push({ offset, level: match[1].length, text });
+    }
+    offset += line.length + 1;
+  }
+  return entries;
+};
+
+/**
+ * Finds the DOM's headings in flat text, in order. A heading `innerText` broke
+ * across lines, or that normalisation changed, is skipped rather than guessed:
+ * a missing map entry costs the model a page, a wrong offset costs it trust.
+ */
+const locateHeadings = (text: string, headings: Heading[]): MapEntry[] => {
+  const entries: MapEntry[] = [];
+  let cursor = 0;
+  for (const heading of headings) {
+    const needle = heading.text.replace(/\s+/g, " ").trim();
+    if (!needle) continue;
+    const at = text.indexOf(needle, cursor);
+    if (at < 0) continue;
+    entries.push({
+      offset: at,
+      level: heading.level,
+      text: plainHeading(needle),
+    });
+    cursor = at + needle.length;
+  }
+  return entries;
+};
+
+const renderMap = (
+  entries: MapEntry[],
+  omitted: number,
+  links: { offset: number; count: number } | undefined,
+  prefix: number,
+  total: number,
+): string => {
+  const top = Math.min(6, ...entries.map((e) => e.level));
+  const lines = [
+    `[Page map: ${total} characters. Each number is a start_index to read from.]`,
+    ...entries.map(
+      (e) => `${prefix + e.offset} ${"  ".repeat(e.level - top)}${e.text}`,
+    ),
+  ];
+  if (omitted > 0) lines.push(`… ${omitted} more headings`);
+  if (links) {
+    lines.push(`${prefix + links.offset} Links: targets [L1]-[L${links.count}]`);
+  }
+  lines.push("[End of page map]");
+  return `${lines.join("\n")}\n\n`;
+};
+
+/**
+ * Picks what fits the budget: the top three heading levels, then fewer levels,
+ * then the first top-level headings in order. Sized with offsets at their widest, so the
+ * offset fix-up below can only shrink the result.
+ */
+const fitMap = (
+  entries: MapEntry[],
+  links: { offset: number; count: number } | undefined,
+  total: number,
+): { entries: MapEntry[]; omitted: number } => {
+  const widest = total + MAP_BUDGET_CHARS;
+  const size = (chosen: MapEntry[], omitted: number) =>
+    renderMap(chosen, omitted, links, widest, widest).length;
+  const top = Math.min(6, ...entries.map((e) => e.level));
+  for (let depth = 2; depth >= 0; depth--) {
+    const chosen = entries.filter((e) => e.level <= top + depth);
+    if (size(chosen, 0) <= MAP_BUDGET_CHARS) {
+      return { entries: chosen, omitted: entries.length - chosen.length };
+    }
+  }
+  // Even the top level does not fit: keep its first headings, in order.
+  const chosen: MapEntry[] = [];
+  for (const entry of entries.filter((e) => e.level === top)) {
+    const rest = entries.length - chosen.length - 1;
+    if (size([...chosen, entry], rest) > MAP_BUDGET_CHARS) break;
+    chosen.push(entry);
+  }
+  return { entries: chosen, omitted: entries.length - chosen.length };
+};
+
+export interface ShapeOptions {
+  readMode: ReadMode;
+  pageUrl: string;
+  headings: Heading[];
+  pageMap: boolean;
+  linkFooter: boolean;
+}
+
+/**
+ * Applies the link footer (markdown only) and the page map (any page longer
+ * than core's default page) to extracted content.
+ */
+export const shapeContent = (
+  content: string,
+  options: ShapeOptions,
+): string => {
+  let body = content;
+  let footer = "";
+  let linkCount = 0;
+  if (options.linkFooter && options.readMode === "markdown") {
+    ({ body, footer, count: linkCount } = toReferenceLinks(
+      content,
+      options.pageUrl,
+    ));
+  }
+  const shaped = body + footer;
+  if (!options.pageMap || shaped.length <= DEFAULT_PAGE_CHARS) return shaped;
+
+  const headings =
+    options.readMode === "markdown"
+      ? markdownHeadings(body)
+      : locateHeadings(body, options.headings);
+  const links = footer
+    ? { offset: body.length + footer.indexOf("Links:"), count: linkCount }
+    : undefined;
+  if (headings.length === 0 && !links) return shaped;
+
+  const { entries, omitted } = fitMap(headings, links, shaped.length);
+  // Offsets count the map itself, whose length depends on how many digits
+  // they have. Widths only grow with the prefix, so this settles in a pass or two.
+  let prefix = 0;
+  let map = "";
+  for (let pass = 0; pass < 8; pass++) {
+    map = renderMap(entries, omitted, links, prefix, prefix + shaped.length);
+    if (map.length === prefix) break;
+    prefix = map.length;
+  }
+  return map + shaped;
 };
 
 class CdpSession {
@@ -348,7 +629,43 @@ const openSocket = (
   });
 
 /**
- * Renders `pageUrl` in the browser at `browserUrl` and returns its text.
+ * Renders `pageUrl` in the browser at `browserUrl` and returns its text,
+ * shaped for core's paging (see `shapeContent`). Same arguments as
+ * `extractPage`, which does the browser work.
+ */
+export const renderPage = async (
+  browserUrl: string,
+  pageUrl: string,
+  timeoutMs: number,
+  readMode: ReadMode,
+  prune: boolean,
+  signal: AbortSignal,
+  browserToken?: string,
+): Promise<RenderedPage> => {
+  const { headings, ...page } = await extractPage(
+    browserUrl,
+    pageUrl,
+    timeoutMs,
+    readMode,
+    prune,
+    signal,
+    browserToken,
+  );
+  return {
+    ...page,
+    content: shapeContent(page.content, {
+      readMode,
+      pageUrl: page.url,
+      headings,
+      pageMap: true,
+      linkFooter: true,
+    }),
+  };
+};
+
+/**
+ * Renders `pageUrl` in the browser at `browserUrl` and returns its text as
+ * extracted, unshaped.
  *
  * `browserUrl` is the CDP HTTP endpoint (e.g. `http://obscura:9222`). Its
  * `/json/version` advertises a WebSocket URL with a loopback authority — correct
@@ -363,7 +680,7 @@ const openSocket = (
  * opened is still closed — an abandoned read must not leave a page loading in
  * the browser.
  */
-export const renderPage = async (
+export const extractPage = async (
   browserUrl: string,
   pageUrl: string,
   timeoutMs: number,
@@ -371,7 +688,7 @@ export const renderPage = async (
   prune: boolean,
   signal: AbortSignal,
   browserToken?: string,
-): Promise<RenderedPage> => {
+): Promise<ExtractedPage> => {
   signal.throwIfAborted();
 
   const auth = browserToken
@@ -459,7 +776,17 @@ export const renderPage = async (
           var url = location.href;
           var contentType = document.contentType;
           ${prune ? pruneJs(readMode) : ""}
-          return { url: url, contentType: contentType };
+          // After pruning, so a heading the page map lists is one the
+          // extractor kept.
+          var headings = [];
+          var hs = document.querySelectorAll("h1, h2, h3, h4, h5, h6");
+          for (var hi = 0; hi < hs.length; hi++) {
+            var ht = (hs[hi].textContent || "").replace(/\\s+/g, " ").trim();
+            if (ht) {
+              headings.push({ level: +hs[hi].tagName.charAt(1), text: ht.slice(0, 200) });
+            }
+          }
+          return { url: url, contentType: contentType, headings: headings };
         })())`,
           returnByValue: true,
         },
@@ -468,7 +795,11 @@ export const renderPage = async (
     );
     const metaRaw = evaluated(meta);
     const parsedMeta = metaRaw
-      ? (JSON.parse(metaRaw) as { url?: unknown; contentType?: unknown })
+      ? (JSON.parse(metaRaw) as {
+          url?: unknown;
+          contentType?: unknown;
+          headings?: unknown;
+        })
       : {};
 
     const content = await step(
@@ -489,6 +820,9 @@ export const renderPage = async (
         typeof parsedMeta.contentType === "string"
           ? parsedMeta.contentType
           : undefined,
+      headings: Array.isArray(parsedMeta.headings)
+        ? (parsedMeta.headings as Heading[])
+        : [],
     };
   } finally {
     if (onAbort) signal.removeEventListener("abort", onAbort);

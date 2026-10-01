@@ -174,7 +174,7 @@ core whose window covers v2 (today `[2, 3]`). A core from before upstream
 | ------------------ | -------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `baseUrl`          | yes      | —          | Base URL of the SearXNG instance as the **backend container** sees it. On a compose network that is the service name, never `localhost`.                                |
 | `browserUrl`       | no       | —          | CDP HTTP endpoint of a headless browser. Omit to contribute search only; no `read_url` tool is built and core substitutes nothing for it.                               |
-| `readMode`         | no       | `markdown` | `markdown` or `text`. Markdown is the only mode that carries link targets, so the model can follow a page instead of searching again; it costs 1.5x-6x more characters. |
+| `readMode`         | no       | `markdown` | `markdown` or `text`. Markdown is the only mode that carries link targets, so the model can follow a page instead of searching again; it costs 1.3x-2.6x more characters. |
 | `pruneBoilerplate` | no       | `true`     | Strip non-content nodes and prefer an `<article>`/`<main>` before extracting.                                                                                           |
 | `language`         | no       | `all`      | SearXNG's language filter.                                                                                                                                              |
 | `categories`       | no       | `general`  | Comma-separated SearXNG categories.                                                                                                                                     |
@@ -250,24 +250,57 @@ follow. Images become their alt text in `markdown` and are dropped in `text`; a
 model reading text cannot open a PNG, and a README's badge URLs are ~100
 characters each.
 
-That resolution is what decides the default:
+### Shaping the first page
 
-| Page                           | `markdown` | links | `text` | links |
-| ------------------------------ | ---------: | ----: | -----: | ----: |
-| a GitHub repository page       |      6,333 |    20 |  5,223 | **0** |
-| theguardian.com/world          |     15,002 |    40 |  6,390 | **0** |
-| edition.cnn.com                |     48,965 |   164 |  9,360 | **0** |
-| en.wikipedia.org/wiki/Platypus |    158,041 | 1,567 | 63,549 | **0** |
+Extraction decides what the page is; shaping decides what the model reads
+first. Models mostly take core's default 5000 characters, so after extraction
+`cdp.ts` rearranges the page without dropping anything from it:
 
-Flat text renders an anchor as its label, so a model reading a page in `text`
-mode has to search again for every hop — and search snippets measure 120-160
-characters, enough to choose a link and never enough to answer. The extra
-characters are a budget the model can page through with `start_index`; a URL it
-never saw it cannot invent.
+1. **Whitespace (markdown).** obscura's converter copies text nodes verbatim, so
+   a site's source indentation arrives as lines of nothing but tabs, which its
+   own blank-line collapsing does not treat as blank. On CNN they were over half
+   of the first page. Outside code fences each line is trimmed and inner runs
+   collapse; inside a fence only trailing whitespace goes, so code keeps its
+   indentation. `text` mode gets the equivalent pass on `innerText`.
+2. **Link footer (markdown).** `[label](url)` becomes `[label][L12]`, and each
+   distinct target is listed once at the end as `[L12]: url`, in order of first
+   use, so the first page's links head the list. Links back into the same page
+   become their label alone — `read_url` on them returns this page again, and
+   Wikipedia's citation markers alone are hundreds of them. The ids carry an `L`
+   because pages keep bracketed numbers of their own (Wikipedia's `[1]`), which
+   markdown would otherwise read as references.
+3. **Page map (any mode).** A page longer than 5000 characters opens with its
+   headings and the `start_index` each begins at, plus where the link list
+   starts — at most 1 200 characters, dropping heading levels and then trailing
+   headings to fit. Markdown headings come from the converted text; `text` mode
+   has no heading syntax, so it locates the DOM's headings in the flat text and
+   skips any it cannot find rather than guessing an offset.
 
-Not solved: a homepage is genuinely mostly links (AP stays at 167 k), and
-real main-content extraction — obscura's `extract_readable_text` — is CLI/MCP-only
-with no CDP surface.
+The cost of the footer is one call: to follow a link, the model reads from the
+offset the map gives. Measured on the same pages (readable = labels and prose in
+the first 5000 characters, without URLs, ids or markup):
+
+| Page                           | `markdown` | links | readable | `text` | links | readable |
+| ------------------------------ | ---------: | ----: | -------: | -----: | ----: | -------: |
+| a GitHub repository page       |      8,045 |    24 |    4,401 |  5,989 | **0** |    4,717 |
+| theguardian.com/world          |     15,358 |    30 |    4,639 |  7,207 | **0** |    4,743 |
+| edition.cnn.com                |     26,614 |    78 |    4,266 | 10,239 | **0** |    4,418 |
+| en.wikipedia.org/wiki/Platypus |    134,874 |   911 |    3,605 | 63,901 | **0** |    4,463 |
+
+Before shaping, the same markdown renders measured 50,968 characters and 1,776
+readable on CNN, and 158,616 and 1,826 on Wikipedia; what remains of the gap to
+`text` is the map plus markup — Wikipedia's infobox tables and emphasis.
+
+That is what decides the default. Flat text renders an anchor as its label, so a
+model reading a page in `text` mode has to search again for every hop — and
+search snippets measure 120-160 characters, enough to choose a link and never
+enough to answer. A URL it never saw it cannot invent.
+
+Not solved: a homepage is genuinely mostly links; apnews.com now serves the
+headless browser a 309-character page in either mode. Real main-content
+extraction — obscura's `extract_readable_text` — is CLI/MCP-only with no CDP
+surface. And whether models actually jump with the map's offsets is untested:
+the offsets are verified exact, the behaviour they are meant to prompt is not.
 
 `timeoutMs` is 60 000 here — sized for a cold render, not for the metasearch, since
 the budget spans the factory and every call in the turn additively. The ceiling
