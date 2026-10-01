@@ -304,14 +304,23 @@ class CdpSession {
   }
 }
 
+// Node's global WebSocket (undici) takes a non-standard second argument with
+// request headers; the DOM typing only knows subprotocols. This is the one way
+// to put a bearer token on the upgrade request. Verified on Node 26.
+const NodeWebSocket = WebSocket as unknown as new (
+  url: string,
+  init?: { headers?: Record<string, string> },
+) => WebSocket;
+
 const openSocket = (
   url: string,
   timeoutMs: number,
   signal: AbortSignal,
+  headers: Record<string, string> | undefined,
 ): Promise<WebSocket> =>
   new Promise((resolve, reject) => {
     if (signal.aborted) return reject(signal.reason);
-    const socket = new WebSocket(url);
+    const socket = new NodeWebSocket(url, headers ? { headers } : undefined);
     const giveUp = (cause: unknown) => {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
@@ -346,6 +355,9 @@ const openSocket = (
  * from inside the browser's own container, useless from another one — so the
  * authority is rewritten to the one we dialled.
  *
+ * `browserToken`, when set, goes out as `Authorization: Bearer` on both the
+ * discovery request and the WebSocket upgrade — obscura checks it on each.
+ *
  * `signal` is core's: it fires when the turn is cancelled or the backend's
  * `timeoutMs` passes. The render then stops at its next step, and the tab it
  * opened is still closed — an abandoned read must not leave a page loading in
@@ -358,11 +370,16 @@ export const renderPage = async (
   readMode: ReadMode,
   prune: boolean,
   signal: AbortSignal,
+  browserToken?: string,
 ): Promise<RenderedPage> => {
   signal.throwIfAborted();
 
+  const auth = browserToken
+    ? { Authorization: `Bearer ${browserToken}` }
+    : undefined;
   const endpoint = new URL("/json/version", browserUrl);
   const response = await fetch(endpoint, {
+    headers: auth,
     signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]),
   });
   if (!response.ok) {
@@ -382,7 +399,7 @@ export const renderPage = async (
   advertised.protocol = dialled.protocol === "https:" ? "wss:" : "ws:";
   advertised.host = dialled.host;
 
-  const socket = await openSocket(advertised.href, timeoutMs, signal);
+  const socket = await openSocket(advertised.href, timeoutMs, signal, auth);
   const cdp = new CdpSession(socket, timeoutMs);
 
   // Each step below is raced against the abort, so a cancelled read stops

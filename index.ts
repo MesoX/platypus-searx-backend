@@ -64,6 +64,20 @@ const configSchema = z
 
 type SearxConfig = z.infer<typeof configSchema>;
 
+// Secrets live here, never in `configSchema`: core validates this block on its
+// own and keeps it out of `config`.
+const credentialsSchema = z
+  .object({
+    // Bearer token for the browser's CDP endpoint. obscura >= 0.2.3 refuses to
+    // listen beyond loopback without OBSCURA_CDP_TOKEN (>= 32 bytes) and then
+    // demands it on `/json/version` and the WebSocket upgrade alike. Set it to
+    // the same value; leave it out for a browser that takes no token.
+    browserToken: z.string().min(32).optional(),
+  })
+  .strict();
+
+type SearxCredentials = z.infer<typeof credentialsSchema>;
+
 // The subset of SearXNG's JSON response this backend reads. Parsed defensively:
 // it is a separate service that can be upgraded independently of this plugin.
 interface SearxResponse {
@@ -94,6 +108,7 @@ export const plugin: PlatypusPlugin = {
   version: "0.1.0",
   apiVersion: PLUGIN_API_VERSION,
   configSchema,
+  credentialsSchema,
   contributes: {
     webBackends: [
       {
@@ -107,8 +122,12 @@ export const plugin: PlatypusPlugin = {
         // Typed as `SearxConfig` rather than cast: core boot-validates the
         // block against `configSchema`, so a missing or malformed one aborts
         // startup and never reaches here.
-        createExecutors: (_ctx, plugin: PluginConfigContext<SearxConfig>) => {
+        createExecutors: (
+          _ctx,
+          plugin: PluginConfigContext<SearxConfig, SearxCredentials>,
+        ) => {
           const config = plugin.config;
+          const browserToken = plugin.credentials.browserToken;
 
           const executors: WebBackendExecutors = {
             web_search: async ({ query }, { signal }) => {
@@ -177,6 +196,7 @@ export const plugin: PlatypusPlugin = {
                 config.readMode,
                 config.pruneBoilerplate,
                 signal,
+                browserToken,
               );
               if (!page.content) {
                 throw new Error(

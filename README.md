@@ -73,15 +73,22 @@ search:
 ### obscura (only if you want `read_url`)
 
 [obscura](https://github.com/h4ckf0r0day/obscura) is a Rust headless browser that
-runs real JavaScript via V8 and speaks the Chrome DevTools Protocol. Its published
-image already defaults to the right command, so the service needs no configuration
-at all:
+runs real JavaScript via V8 and speaks the Chrome DevTools Protocol.
+
+Since **0.2.3** it refuses to listen beyond loopback without
+`OBSCURA_CDP_TOKEN` (at least 32 bytes) — and a container must listen on
+`0.0.0.0` for the backend to reach it — so give it a token and hand the plugin
+the same value as `credentials.browserToken` ([Configure](#configure)). The
+plugin sends it as `Authorization: Bearer` on `/json/version` and on the
+WebSocket upgrade, which is where obscura checks it.
 
 ```yaml
 services:
   obscura:
     image: h4ckf0r0day/obscura:latest
     command: ["serve", "--port", "9222", "--host", "0.0.0.0"]
+    environment:
+      OBSCURA_CDP_TOKEN: ${OBSCURA_CDP_TOKEN} # openssl rand -hex 32, in .env
     networks: [platypus-network]
     # Loopback only — see the warning below. Omit entirely if you never need to
     # poke at it by hand.
@@ -93,9 +100,9 @@ services:
 Verify it from inside the network, which is how the plugin sees it:
 
 ```bash
-docker compose exec backend node -e \
-  "fetch('http://obscura:9222/json/version').then(r=>r.json()).then(v=>console.log(v.Browser))"
-# → Chrome/145.0.0.0
+docker compose exec -e T="$OBSCURA_CDP_TOKEN" backend node -e \
+  "fetch('http://obscura:9222/json/version',{headers:{Authorization:'Bearer '+process.env.T}}).then(r=>r.json()).then(v=>console.log(v.Browser))"
+# → Chrome/145.0.0.0   (401 without the header)
 ```
 
 **Any Chrome-protocol browser works.** The client uses only `Target.createTarget`,
@@ -150,7 +157,7 @@ Two details that decide whether this resolves:
 
 ```
 PLATYPUS_PLUGINS=@platypus/web-fetch,/app/plugins/searx/index.ts
-PLATYPUS_PLUGIN_CONFIG_SEARX={"config":{"baseUrl":"http://searxng:8080","browserUrl":"http://obscura:9222"}}
+PLATYPUS_PLUGIN_CONFIG_SEARX={"config":{"baseUrl":"http://searxng:8080","browserUrl":"http://obscura:9222"},"credentials":{"browserToken":"<OBSCURA_CDP_TOKEN>"}}
 ```
 
 The plugin **list** takes whatever `import()` can resolve — a package specifier
@@ -172,10 +179,15 @@ core whose window covers v2 (today `[2, 3]`). A core from before upstream
 | `language`         | no       | `all`      | SearXNG's language filter.                                                                                                                                              |
 | `categories`       | no       | `general`  | Comma-separated SearXNG categories.                                                                                                                                     |
 
-Config is validated at boot and fails loud: malformed JSON, an unknown key or a
-non-URL `baseUrl` aborts startup with a plugin-named error. There are no secrets
-here — if a backend ever needs an API key it belongs in `credentials`, never in
-`config`.
+`credentials` holds the one secret:
+
+| Key            | Required | Meaning                                                                                                                       |
+| -------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `browserToken` | no       | Bearer token for `browserUrl` — the browser's `OBSCURA_CDP_TOKEN`, at least 32 characters. Omit for a browser that takes none. |
+
+Both blocks are validated at boot and fail loud: malformed JSON, an unknown key,
+a non-URL `baseUrl` or a token under 32 characters aborts startup with a
+plugin-named error. Secrets go in `credentials`, never in `config`.
 
 `browserUrl` is deliberately Operator config and never anything the model can
 influence. Core's egress guard covers the **model-supplied** URL handed to
